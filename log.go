@@ -12,6 +12,16 @@
 // printed does not end in a newline, the logger will add one.
 // The Fatal functions call [os.Exit](1) after writing the log message.
 // The Panic functions call panic after writing the log message.
+// Package log 实现了一个简单的日志包。它定义了 [Logger] 类型，
+// 并提供了一系列用于格式化输出的方法。
+// 此外，该包还预定义了一个“标准” Logger，可以通过 Print[f|ln]、
+// Fatal[f|ln] 和 Panic[f|ln] 等辅助函数直接使用，
+// 无需手动创建 Logger 实例。
+// 标准 Logger 将日志写入标准错误输出，并在每条日志中打印日期和时间。
+// 每条日志单独占用一行。如果日志消息末尾没有换行符，
+// Logger 会自动添加一个换行符。
+// Fatal 系列函数在写入日志后调用 [os.Exit](1) 终止程序。
+// Panic 系列函数在写入日志后调用 panic。
 package log
 
 import (
@@ -39,6 +49,21 @@ import (
 // while flags Ldate | Ltime | Lmicroseconds | Llongfile produce,
 //
 //	2009/01/23 01:23:23.123123 /a/b/c/d.go:23: message
+// 这些标志位用于控制 [Logger] 生成的每条日志前缀中包含哪些内容。
+// 可以通过按位或运算（|）组合多个标志位，以控制输出的内容。
+//
+// 除 Lmsgprefix 标志位外，其他标志位的输出顺序（按照此处列出的顺序）
+// 和输出格式（如下方注释所述）均不可自定义。
+//
+// 只有指定 Llongfile 或 Lshortfile 标志位时，文件信息后才会添加冒号。
+//
+// 例如，使用 Ldate | Ltime（或 LstdFlags）会生成：
+//
+//	2009/01/23 01:23:23 message
+//
+// 而使用 Ldate | Ltime | Lmicroseconds | Llongfile 则会生成：
+//
+//	2009/01/23 01:23:23.123123 /a/b/c/d.go:23: message
 const (
 	Ldate         = 1 << iota     // the date in the local time zone: 2009/01/23
 	Ltime                         // the time in the local time zone: 01:23:23
@@ -54,6 +79,8 @@ const (
 // output to an [io.Writer]. Each logging operation makes a single call to
 // the Writer's Write method. A Logger can be used simultaneously from
 // multiple goroutines; it guarantees to serialize access to the Writer.
+// Logger 可以被多个 goroutine 同时使用，
+// 并保证对 Writer 的访问是串行化的。
 type Logger struct {
 	outMu sync.Mutex
 	out   io.Writer // destination for output
@@ -68,6 +95,8 @@ type Logger struct {
 // The prefix appears at the beginning of each generated log line, or
 // after the log header if the [Lmsgprefix] flag is provided.
 // The flag argument defines the logging properties.
+// prefix 参数指定每条日志的前缀，默认位于日志行的开头；
+// 如果设置了 [Lmsgprefix] 标志位，则前缀会出现在日志头部之后。
 func New(out io.Writer, prefix string, flag int) *Logger {
 	l := new(Logger)
 	l.SetOutput(out)
@@ -81,21 +110,38 @@ func (l *Logger) SetOutput(w io.Writer) {
 	l.outMu.Lock()
 	defer l.outMu.Unlock()
 	l.out = w
+	// io.Discard 是 Go 标准库提供的一个特殊 io.Writer。无论写入什么数据，都会直接丢弃，并返回写入成功。
+	// 这里通过接口比较判断 w 是否为 io.Discard，要求动态类型和动态值均相等。
+	// isDiscard 使用 atomic.Bool，允许其他 goroutine 无需获取 outMu 就能安全读取该状态，
+	// 从而在日志被丢弃时提前返回，属于快速路径（Fast Path）优化。
 	l.isDiscard.Store(w == io.Discard)
 }
 
+// 默认输出目标是 os.Stderr，而不是 os.Stdout
+// 这是 Unix/Linux 的传统设计习惯。
+// 标准输出 stdout 通常用于输出程序的正常结果，而标准错误 stderr 用于诊断信息，包括日志。
 var std = New(os.Stderr, "", LstdFlags)
 
 // Default returns the standard logger used by the package-level output functions.
 func Default() *Logger { return std }
 
 // Cheap integer to fixed-width decimal ASCII. Give a negative width to avoid zero-padding.
+// 将整数快速转换为固定宽度的十进制 ASCII 字符。如果 wid 为负数，则不进行前导零填充。
+// 注意：该函数仅用于内部日志格式化，要求 i 为非负整数，
+// 且 wid 不得超过临时缓冲区能够容纳的范围。
+// Integer to ASCII
 func itoa(buf *[]byte, i int, wid int) {
 	// Assemble decimal in reverse order.
+	// 按照从低位到高位的顺序，逆向构造十进制数字。
+	// 使用固定长度的字节数组作为临时缓冲区。
+	// 64 位有符号整数的最大值为 9223372036854775807，共 19 位十进制数字。
+	// 这里使用 20 字节的缓冲区，足以容纳该范围内的非负整数。
 	var b [20]byte
+	// 从数组末尾开始，逆向写入十进制数字。
 	bp := len(b) - 1
 	for i >= 10 || wid > 1 {
 		wid--
+		// 下面两行等价 b[bp] = byte('0' + i%10)
 		q := i / 10
 		b[bp] = byte('0' + i - q*10)
 		bp--
@@ -103,6 +149,8 @@ func itoa(buf *[]byte, i int, wid int) {
 	}
 	// i < 10
 	b[bp] = byte('0' + i)
+	// 将临时数组中有效的数字字符追加到目标缓冲区，
+	// 而不是重新创建一个字符串。
 	*buf = append(*buf, b[bp:]...)
 }
 
@@ -111,14 +159,27 @@ func itoa(buf *[]byte, i int, wid int) {
 //   - date and/or time (if corresponding flags are provided),
 //   - file and line number (if corresponding flags are provided),
 //   - l.prefix (if it's not blank and Lmsgprefix is set).
+// formatHeader 按照以下顺序将日志头部写入 buf：
+//   - l.prefix（如果前缀非空，且未设置 Lmsgprefix）；
+//   - 日期和/或时间（如果设置了对应的标志位）；
+//   - 文件名和行号（如果设置了对应的标志位）；
+//   - l.prefix（如果前缀非空，且设置了 Lmsgprefix）。
 func formatHeader(buf *[]byte, t time.Time, prefix string, flag int, file string, line int) {
+	// 如果没有设置 Lmsgprefix，就将自定义前缀放在日志最前面。
 	if flag&Lmsgprefix == 0 {
+		// 使用 ... 将字符串的字节追加到 []byte
 		*buf = append(*buf, prefix...)
 	}
+
+	
+	// 如果需要输出日期或时间，则进入时间格式化逻辑。
+	// Lmicroseconds 隐含 Ltime，因此单独设置它也会输出时、分、秒。
 	if flag&(Ldate|Ltime|Lmicroseconds) != 0 {
 		if flag&LUTC != 0 {
+			// 如果启用了 LUTC，则将时间转换为 UTC 时区。
 			t = t.UTC()
 		}
+		// 处理年月日
 		if flag&Ldate != 0 {
 			year, month, day := t.Date()
 			itoa(buf, year, 4)
@@ -128,6 +189,7 @@ func formatHeader(buf *[]byte, t time.Time, prefix string, flag int, file string
 			itoa(buf, day, 2)
 			*buf = append(*buf, ' ')
 		}
+		// 处理时间
 		if flag&(Ltime|Lmicroseconds) != 0 {
 			hour, min, sec := t.Clock()
 			itoa(buf, hour, 2)
@@ -137,12 +199,18 @@ func formatHeader(buf *[]byte, t time.Time, prefix string, flag int, file string
 			itoa(buf, sec, 2)
 			if flag&Lmicroseconds != 0 {
 				*buf = append(*buf, '.')
+
+				// 将纳秒转换为微秒，并使用 6 位宽度进行零填充。
 				itoa(buf, t.Nanosecond()/1e3, 6)
 			}
 			*buf = append(*buf, ' ')
 		}
 	}
+	// 处理文件名
+	// 如果同时启用了 Lshortfile 和 Llongfile，优先使用 Lshortfile。
 	if flag&(Lshortfile|Llongfile) != 0 {
+
+		// 从文件路径的末尾开始反向扫描，寻找最后一个 /
 		if flag&Lshortfile != 0 {
 			short := file
 			for i := len(file) - 1; i > 0; i-- {
@@ -153,6 +221,7 @@ func formatHeader(buf *[]byte, t time.Time, prefix string, flag int, file string
 			}
 			file = short
 		}
+		
 		*buf = append(*buf, file...)
 		*buf = append(*buf, ':')
 		itoa(buf, line, -1)
@@ -163,24 +232,66 @@ func formatHeader(buf *[]byte, t time.Time, prefix string, flag int, file string
 	}
 }
 
-var bufferPool = sync.Pool{New: func() any { return new([]byte) }}
+// 使用 sync.Pool 复用日志缓冲区，减少频繁创建临时对象带来的内存分配和 GC 压力。
+// Pool 中的对象可能被 GC 清理，不保证每次 Get 都能取得之前 Put 的对象。
+var bufferPool = sync.Pool{
+	New: func() any {
+			// 没有使用 return make([]byte, 0, 1024)， 减少切片装箱到接口时可能产生的额外分配。
+			// new([]byte) 创建一个指向 nil 切片的指针，不预先分配底层字节数组。
+			// 后续通过 append 按需扩容，并在归还 Pool 后供其他日志操作复用。
+			// 关于装箱：
+			// *[]byte 装箱到 any 时，接口的数据字可以直接保存指针（64 位环境下为 8 字节），
+			// 避免直接装箱 []byte 时可能产生的切片头部复制与额外堆分配。通过 sync.Pool 复用该指针指向的切片头部及底层数组，
+			// 进一步降低内存分配开销。
+	 		return new([]byte)
+		},
+	}
 
+// getBuffer 从对象池中获取一个可复用的字节缓冲区。
 func getBuffer() *[]byte {
+	// Get 返回 any，通过类型断言还原为 *[]byte。
+	// 另外 sync.Pool.Get() 不保证一定返回之前 Put() 的那个对象。
 	p := bufferPool.Get().(*[]byte)
+
+	// 将切片长度重置为 0，保留底层数组及容量，以便后续 append 复用。
+	// 这里没有清空底层数组，也没有释放内存。
 	*p = (*p)[:0]
 	return p
 }
 
+
+// 这里把缓存重新放回缓冲池，同时使用了一种策略使得池内部的对象大小不会相差太大，
+// 缓冲区	容量
+// A	128 B
+// B	512 B
+// C	4 KiB
+// D	1 MiB
+// E	10 MiB
+// 假设绝大多数日志只有几百字节，那么 D 和 E 的大型缓冲区就没有必要长期留在对象池中。
+// 所以这里使用了一个简单的容量限制：设置 64 KiB 的容量上限。超过上限时，不再复用原来的底层字节数组，但仍然复用切片头部。
 func putBuffer(p *[]byte) {
 	// Proper usage of a sync.Pool requires each entry to have approximately
 	// the same memory cost. To obtain this property when the stored type
 	// contains a variably-sized buffer, we add a hard limit on the maximum buffer
 	// to place back in the pool.
+	// 正确使用 sync.Pool 时，应尽量保证池中每个对象的内存开销大致相同。
+	// 当存储的对象包含大小可变的缓冲区时，为了满足这一要求，
+	// 我们对允许放回对象池的缓冲区设置了一个严格的容量上限。
 	//
 	// See https://go.dev/issue/23199
+
+	// 如果当前切片的容量超过 64 KiB，就不再保留它的底层字节数组。
+	// 64<<10 = 64 * 2^10
+	// 使用 > 而非 >=，因此容量恰好为 64 KiB 时仍然保留底层数组。
 	if cap(*p) > 64<<10 {
 		*p = nil
 	}
+
+	// 另外这里没有丢弃 p，再次放进去了，
+	// 是因为 既然 *[]byte 指针本身仍然可以复用，就没有必要把整个对象一起丢弃。
+	// 即使底层字节数组不再保留，p 指向的切片头部仍然可以复用。
+	// 将 *p 设置为 nil 后，原来的底层数组在没有其他引用时可以被 GC 回收。
+	// 最后将 p 放回 Pool，避免下次重新分配切片头部。
 	bufferPool.Put(p)
 }
 
@@ -190,7 +301,17 @@ func putBuffer(p *[]byte) {
 // already a newline. Calldepth is used to recover the PC and is
 // provided for generality, although at the moment on all pre-defined
 // paths it will be 2.
+// 
+// Output 写入一次日志事件的输出内容。
+// 字符串 s 包含需要打印在 Logger 标志位所指定的前缀之后的文本。
+// 如果 s 的最后一个字符不是换行符，则会自动追加换行符。
+// calldepth 用于获取程序计数器（PC），
+// 虽然目前所有预定义的调用路径中该值都是 2，
+// 但为了保持通用性，仍然将其作为参数提供。
 func (l *Logger) Output(calldepth int, s string) error {
+	
+	// calldepth + 1：跳过当前 Output() 增加的调用栈帧。
+	// 通过匿名函数将字符串追加到内部提供的字节缓冲区。
 	return l.output(0, calldepth+1, func(b []byte) []byte { // +1 for this frame.
 		return append(b, s...)
 	})
@@ -198,29 +319,54 @@ func (l *Logger) Output(calldepth int, s string) error {
 
 // output can take either a calldepth or a pc to get source line information.
 // It uses the pc if it is non-zero.
+//
+//  output 可以通过 calldepth 或 pc 获取源码行号信息。
+// 如果 pc 不为 0，则优先使用 pc。
 func (l *Logger) output(pc uintptr, calldepth int, appendOutput func([]byte) []byte) error {
+
+	// 快速路径：判断是否丢弃日志
 	if l.isDiscard.Load() {
 		return nil
 	}
 
+	// 获取时间
 	now := time.Now() // get this early.
 
 	// Load prefix and flag once so that their value is consistent within
 	// this call regardless of any concurrent changes to their value.
+
+	// 只读取一次 prefix 和 flag，确保在本次调用期间，
+	// 即使其他 goroutine 并发修改这些值，
+	// 本次日志操作使用的对应值也保持一致。
+	// 如果 output() 在执行过程中多次读取 Flags，就可能出现同一条日志的不同部分使用不同配置的情况。
 	prefix := l.Prefix()
 	flag := l.Flags()
 
 	var file string
 	var line int
 	if flag&(Lshortfile|Llongfile) != 0 {
+
+		// 通过调用栈深度查找
 		if pc == 0 {
 			var ok bool
+			// calldepth 用于跳过多少层调用
+			// runtime.Caller(skip)	获取的位置
+			// 0	Logger.output() 中调用 runtime.Caller 的那一行
+			// 1	Logger.Output() 中调用 l.output 的那一行
+			// 2	main() 中调用 logger.Output 的那一行
+			// 3	main() 的调用者（如果存在）
 			_, file, line, ok = runtime.Caller(calldepth)
+
+			// 没有找到对应的栈帧就使用默认值 ???
 			if !ok {
 				file = "???"
 				line = 0
 			}
+
+		// 如果 pc 不等于 0
 		} else {
+			// 将 PC 转换成包含函数名、文件名和行号等信息的 Frame。
+			// 因为某些调用路径可能已经知道日志事件对应的 PC，没有必要再依赖当前调用栈深度查找。
 			fs := runtime.CallersFrames([]uintptr{pc})
 			f, _ := fs.Next()
 			file = f.File
@@ -231,22 +377,40 @@ func (l *Logger) output(pc uintptr, calldepth int, appendOutput func([]byte) []b
 		}
 	}
 
+	// 获取缓冲区并把长度设置为 0 
 	buf := getBuffer()
+
+	// 后续正常返回还是发生可恢复的 panic都要归还
 	defer putBuffer(buf)
+
+	// 构造日志头部并添加到buf中
 	formatHeader(buf, now, prefix, flag, file, line)
+
+	// 追加日志正文，这是一个回调函数
 	*buf = appendOutput(*buf)
+
+	// 确保日志以换行符结尾
 	if len(*buf) == 0 || (*buf)[len(*buf)-1] != '\n' {
 		*buf = append(*buf, '\n')
 	}
 
+	// 加锁写入
 	l.outMu.Lock()
 	defer l.outMu.Unlock()
 	_, err := l.out.Write(*buf)
 	return err
 }
 
+// init 在 log 包初始化时执行，为 internal.DefaultOutput 注入函数实现。
+// 使 log/slog 能通过 internal 包间接调用 log.Logger 未导出的 output 方法。
+
 func init() {
+ // DefaultOutput 是 log/internal 中声明的函数变量。
+    // 这里将匿名函数赋值给它，而不是调用它。
 	internal.DefaultOutput = func(pc uintptr, data []byte) error {
+  		// std 是 log 包的默认 Logger。
+        // 如果 pc 非零，内部 output 会根据 PC 解析源码位置，
+        // 此时 calldepth 参数不会被使用，因此传入 0。
 		return std.output(pc, 0, func(buf []byte) []byte {
 			return append(buf, data...)
 		})
@@ -255,33 +419,64 @@ func init() {
 
 // Print calls l.Output to print to the logger.
 // Arguments are handled in the manner of [fmt.Print].
+// Print 调用 l.Output，将日志输出到 Logger。
+// 参数的处理方式与 [fmt.Print] 相同。
 func (l *Logger) Print(v ...any) {
+
+	// skip	源码位置
+	// 0	Logger.output()
+	// 1	Logger.Print()
+	// 2	main() 中调用 Logger.Print() 的位置
+	// 
+	// 这里忽略了 output 的错误返回值
 	l.output(0, 2, func(b []byte) []byte {
+
+		// 按照 fmt.Print 的规则格式化参数，
+		// 并直接追加到已有的字节缓冲区。
 		return fmt.Append(b, v...)
 	})
 }
 
 // Printf calls l.Output to print to the logger.
 // Arguments are handled in the manner of [fmt.Printf].
+// Printf 调用 l.Output，将日志输出到 Logger。
+// 参数的处理方式与 [fmt.Printf] 相同。
 func (l *Logger) Printf(format string, v ...any) {
+
+	// calldepth = 2，跳过 Logger.output() 和 Logger.Printf()，
+	// 获取真正调用 Printf 的源码位置。
+	// 这里同样忽略了 output 返回的 error。
 	l.output(0, 2, func(b []byte) []byte {
+		// 按照 format 指定的格式处理参数，
+		// 将结果直接追加到已有的字节缓冲区，避免创建中间字符串。
 		return fmt.Appendf(b, format, v...)
 	})
 }
 
 // Println calls l.Output to print to the logger.
 // Arguments are handled in the manner of [fmt.Println].
+// Println 调用 l.Output，将日志输出到 Logger。
+// 参数的处理方式与 [fmt.Println] 相同。
 func (l *Logger) Println(v ...any) {
+	// calldepth = 2，跳过 Logger.output() 和 Logger.Println()，
+	// 获取真正调用 Println 的源码位置。
+	// 当前实现直接调用内部的 l.output()，并忽略其返回的 error。
 	l.output(0, 2, func(b []byte) []byte {
+		// 按照 fmt.Println 的规则格式化参数，
+		// 在参数之间添加空格，并在末尾追加换行符。
 		return fmt.Appendln(b, v...)
 	})
 }
 
 // Fatal is equivalent to l.Print() followed by a call to [os.Exit](1).
+// Fatal 等价于调用 l.Print()，随后调用 [os.Exit](1)。
 func (l *Logger) Fatal(v ...any) {
 	l.output(0, 2, func(b []byte) []byte {
 		return fmt.Append(b, v...)
 	})
+
+	// 以状态码 1 立即终止整个进程，不会执行调用栈中尚未执行的 defer。
+	// 但 output() 已正常返回，其内部 defer 已经执行完毕。
 	os.Exit(1)
 }
 
@@ -302,11 +497,15 @@ func (l *Logger) Fatalln(v ...any) {
 }
 
 // Panic is equivalent to l.Print() followed by a call to panic().
+// Panic 等价于调用 l.Print()，随后调用 panic()。
 func (l *Logger) Panic(v ...any) {
 	s := fmt.Sprint(v...)
 	l.output(0, 2, func(b []byte) []byte {
 		return append(b, s...)
 	})
+	
+	// 触发 panic，使用相同的字符串作为 panic 值。
+	// 栈展开过程中会执行相应的 defer，并可能被 recover() 恢复。
 	panic(s)
 }
 
